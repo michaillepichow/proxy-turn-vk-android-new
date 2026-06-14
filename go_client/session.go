@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -20,11 +21,12 @@ import (
 
 const (
 	workerSendBuf      = 128
-	sessionReadTimeout = 30 * time.Minute // Increased from 60s to 30min
+	sessionReadTimeout = 30 * time.Minute
 	readBufSize        = 1600
 	socketBufSize      = 625 * 1024
-	keepaliveByte      = 0xFF // DTLS-level keepalive marker
+	keepaliveByte      = 0xFF
 	keepaliveInterval  = 15 * time.Second
+	maxReadErrorCount  = 10
 )
 
 // Handshake semaphore: limit to 3 concurrent DTLS handshakes
@@ -52,6 +54,18 @@ func (n *NullLogger) Errorf(_ string, _ ...interface{}) {}
 type connectedUDPConn struct{ *net.UDPConn }
 
 func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) { return c.Write(p) }
+
+// isEOFError проверяет, является ли ошибка EOF или закрытием соединения
+func isEOFError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == io.EOF || err == io.ErrClosedPipe {
+		return true
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "closed") || strings.Contains(errStr, "EOF")
+}
 
 func RunSession(
 	ctx context.Context,
@@ -190,19 +204,43 @@ func RunSession(
 	defer stopRelay()
 
 	// relay → pipeA (UNWRAP: strip RTP header + decrypt)
+	// ✅ ИСПРАВЛЕНИЯ: Правильная обработка ошибок EOF и input errors
 	go func() {
 		defer relayWg.Done()
 		defer sessCancel()
-		// Max incoming: RTP header (12) + AEAD tag (16) + padding.
-		readBufLen := readBufSize + 80
+		readBufLen := readBufSize + 128
 		buf := make([]byte, readBufLen)
 		plain := make([]byte, readBufSize)
+		errorCount := 0
+
 		for {
 			n, _, readErr := relay.ReadFrom(buf)
 			if readErr != nil {
-				return
+				// ✅ Проверяем EOF/Closed соединение
+				if isEOFError(readErr) {
+					log.Printf("[СЕССИЯ #%d] RELAY: Соединение закрыто (EOF)", sessionID)
+					return
+				}
+				// ✅ Проверяем net.Error timeout
+				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
+					errorCount++
+					if errorCount > maxReadErrorCount {
+						log.Printf("[СЕССИЯ #%d] RELAY: Слишком много таймаутов (%d), выходим", sessionID, errorCount)
+						return
+					}
+					continue
+				}
+				// ✅ Логируем любые другие ошибки
+				log.Printf("[СЕССИЯ #%d] RELAY ReadFrom ошибка: %v (тип: %T)", sessionID, readErr, readErr)
+				errorCount++
+				if errorCount > maxReadErrorCount {
+					return
+				}
+				continue
 			}
+			errorCount = 0 // Reset on success
 			payload := buf[:n]
+
 			if useWrap {
 				if !obfsIsRTPPacket(payload) {
 					log.Printf("[СЕССИЯ #%d] OBFS unwrap: unexpected packet (n=%d)", sessionID, n)
@@ -215,22 +253,50 @@ func RunSession(
 				}
 				payload = plain[:m]
 			}
+
 			if _, writeErr := pipeA.WriteTo(payload, peer); writeErr != nil {
+				if isEOFError(writeErr) {
+					log.Printf("[СЕССИЯ #%d] PIPE WriteTo закрыт", sessionID)
+				} else {
+					log.Printf("[СЕССИЯ #%d] PIPE WriteTo ошибка: %v", sessionID, writeErr)
+				}
 				return
 			}
 		}
 	}()
 
 	// pipeA → relay (WRAP: add RTP header + encrypt)
+	// ✅ ИСПРАВЛЕНИЯ: Правильная обработка ошибок EOF
 	go func() {
 		defer relayWg.Done()
 		defer sessCancel()
 		b := make([]byte, readBufSize)
+		errorCount := 0
+
 		for {
 			n, _, readErr := pipeA.ReadFrom(b)
 			if readErr != nil {
-				return
+				if isEOFError(readErr) {
+					log.Printf("[СЕССИЯ #%d] PIPE ReadFrom закрыт (EOF)", sessionID)
+					return
+				}
+				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
+					errorCount++
+					if errorCount > maxReadErrorCount {
+						log.Printf("[СЕССИЯ #%d] PIPE: Слишком много таймаутов, выходим", sessionID)
+						return
+					}
+					continue
+				}
+				log.Printf("[СЕССИЯ #%d] PIPE ReadFrom ошибка: %v", sessionID, readErr)
+				errorCount++
+				if errorCount > maxReadErrorCount {
+					return
+				}
+				continue
 			}
+			errorCount = 0
+
 			out := b[:n]
 			if useWrap {
 				if obfsCfg != nil && obfsWriteState != nil {
@@ -242,7 +308,9 @@ func RunSession(
 					out = wrapped
 				}
 			}
+
 			if _, writeErr := relay.WriteTo(out, peer); writeErr != nil {
+				log.Printf("[СЕССИЯ #%d] RELAY WriteTo ошибка: %v", sessionID, writeErr)
 				return
 			}
 		}
@@ -267,7 +335,6 @@ func RunSession(
 		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
 		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
-		// No ServerName (SNI) — less detectable by DPI
 	}
 
 	dtlsConn, err := dtls.Client(pipeB, peer, dtlsCfg)
@@ -281,7 +348,7 @@ func RunSession(
 	log.Printf("[ВОРКЕР #%d] [DTLS] Рукопожатие (Handshake)...", sessionID)
 	err = dtlsConn.HandshakeContext(hctx)
 	hcancel()
-	<-handshakeSem // RELEASE SEMAPHORE IMMEDIATELY AFTER HANDSHAKE
+	<-handshakeSem
 
 	if err != nil {
 		if useWrap {
@@ -332,7 +399,7 @@ func RunSession(
 
 	// Proxy DTLS ↔ Dispatcher
 	var proxyWg sync.WaitGroup
-	proxyWg.Add(3) // +1 for keepalive goroutine
+	proxyWg.Add(3)
 
 	stopDTLS := context.AfterFunc(sessCtx, func() {
 		_ = dtlsConn.SetDeadline(time.Now())
@@ -359,6 +426,7 @@ func RunSession(
 	}()
 
 	// Writer: dispatcher → DTLS
+	// ✅ ИСПРАВЛЕНИЯ: Правильная обработка ошибок при записи
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
@@ -370,11 +438,13 @@ func RunSession(
 				if !ok {
 					return
 				}
-				_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
+				_ = dtlsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				_, writeErr := dtlsConn.Write(pkt)
 				putPktBuf(pkt)
 				if writeErr != nil {
-					log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
+					if !isEOFError(writeErr) {
+						log.Printf("[ВОРКЕР #%d] Writer ошибка: %v", sessionID, writeErr)
+					}
 					return
 				}
 			}
@@ -382,9 +452,12 @@ func RunSession(
 	}()
 
 	// Reader: DTLS → dispatcher
+	// ✅ ИСПРАВЛЕНИЯ: Правильная обработка ошибок ввода с логированием типа
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
+		errorCount := 0
+
 		for {
 			pkt := getPktBuf(2048)
 			_ = dtlsConn.SetReadDeadline(time.Now().Add(sessionReadTimeout))
@@ -394,12 +467,33 @@ func RunSession(
 				if sessCtx.Err() != nil {
 					return
 				}
+
+				// ✅ Проверяем EOF
+				if isEOFError(readErr) {
+					log.Printf("[ВОРКЕР #%d] DTLS Reader: соединение закрыто (EOF)", sessionID)
+					return
+				}
+
+				// ✅ Проверяем timeout
 				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
+					errorCount++
+					if errorCount > maxReadErrorCount {
+						log.Printf("[ВОРКЕР #%d] DTLS Reader: слишком много таймаутов (%d)", sessionID, errorCount)
+						return
+					}
 					continue
 				}
-				log.Printf("[ВОРКЕР #%d] Ошибка Reader: %v", sessionID, readErr)
-				return
+
+				// ✅ Логируем другие ошибки
+				log.Printf("[ВОРКЕР #%d] DTLS Reader ошибка: %v (тип: %T)", sessionID, readErr, readErr)
+				errorCount++
+				if errorCount > maxReadErrorCount {
+					return
+				}
+				continue
 			}
+
+			errorCount = 0 // Reset on success
 
 			// Skip keepalive pong from server
 			if n == 1 && pkt[0] == keepaliveByte {
